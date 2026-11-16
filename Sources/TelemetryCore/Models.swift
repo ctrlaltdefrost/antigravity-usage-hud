@@ -63,6 +63,9 @@ public struct ProjectSpend: Sendable, Codable, Equatable, Identifiable {
     public var tokens5h: Int
     public var tokens24h: Int
     public var tokens7d: Int
+    public var cost5h: Double
+    public var cost24h: Double
+    public var cost7d: Double
     public var share5h: Double
     public var activeAgents: Int
     public var lastActive: Date
@@ -75,6 +78,9 @@ public struct ProjectSpend: Sendable, Codable, Equatable, Identifiable {
         tokens5h: Int,
         tokens24h: Int,
         tokens7d: Int,
+        cost5h: Double = 0.0,
+        cost24h: Double = 0.0,
+        cost7d: Double = 0.0,
         share5h: Double,
         activeAgents: Int,
         lastActive: Date,
@@ -86,6 +92,9 @@ public struct ProjectSpend: Sendable, Codable, Equatable, Identifiable {
         self.tokens5h = tokens5h
         self.tokens24h = tokens24h
         self.tokens7d = tokens7d
+        self.cost5h = cost5h
+        self.cost24h = cost24h
+        self.cost7d = cost7d
         self.share5h = min(max(share5h, 0.0), 1.0)
         self.activeAgents = activeAgents
         self.lastActive = lastActive
@@ -191,6 +200,7 @@ public struct TelemetrySnapshot: Sendable, Codable, Equatable {
     public var activeModelName: String?
     public var cliAgentState: String?
     public var cliContextUsedPercent: Double?
+    public var planTier: String?
     public var alerts: [PriorityAlert]
     public var pinnedProjectId: String?
     public var hookInstalled: Bool
@@ -206,6 +216,7 @@ public struct TelemetrySnapshot: Sendable, Codable, Equatable {
         activeModelName: String?,
         cliAgentState: String?,
         cliContextUsedPercent: Double?,
+        planTier: String? = nil,
         alerts: [PriorityAlert],
         pinnedProjectId: String?,
         hookInstalled: Bool
@@ -220,6 +231,7 @@ public struct TelemetrySnapshot: Sendable, Codable, Equatable {
         self.activeModelName = activeModelName
         self.cliAgentState = cliAgentState
         self.cliContextUsedPercent = cliContextUsedPercent
+        self.planTier = planTier
         self.alerts = alerts
         self.pinnedProjectId = pinnedProjectId
         self.hookInstalled = hookInstalled
@@ -237,6 +249,7 @@ public struct TelemetrySnapshot: Sendable, Codable, Equatable {
             activeModelName: nil,
             cliAgentState: nil,
             cliContextUsedPercent: nil,
+            planTier: nil,
             alerts: [],
             pinnedProjectId: nil,
             hookInstalled: false

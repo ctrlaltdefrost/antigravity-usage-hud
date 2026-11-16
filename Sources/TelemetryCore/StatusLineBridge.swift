@@ -4,20 +4,26 @@ public struct StatusLinePayload: Sendable, Codable, Equatable {
     public var modelDisplayName: String?
     public var agentState: String?
     public var contextUsedPercentage: Double?
+    public var planTier: String?
     public var quotas: [QuotaBucketSnapshot]
+    public var hasFreshQuotaPayload: Bool
     public var lastUpdated: Date
 
     public init(
         modelDisplayName: String?,
         agentState: String?,
         contextUsedPercentage: Double?,
+        planTier: String? = nil,
         quotas: [QuotaBucketSnapshot],
+        hasFreshQuotaPayload: Bool? = nil,
         lastUpdated: Date
     ) {
         self.modelDisplayName = modelDisplayName
         self.agentState = agentState
         self.contextUsedPercentage = contextUsedPercentage
+        self.planTier = planTier
         self.quotas = quotas
+        self.hasFreshQuotaPayload = hasFreshQuotaPayload ?? !quotas.isEmpty
         self.lastUpdated = lastUpdated
     }
 }
@@ -75,31 +81,40 @@ public final class StatusLineBridge: @unchecked Sendable {
             return nil
         }
 
-        var modelDisplayName: String?
+        var rawModelDisplayName: String?
         if let modelDict = root["model"] as? [String: Any] {
-            modelDisplayName = (modelDict["display_name"] as? String)
+            rawModelDisplayName = (modelDict["display_name"] as? String)
                 ?? (modelDict["name"] as? String)
                 ?? (modelDict["id"] as? String)
         } else if let modelStr = root["model"] as? String {
-            modelDisplayName = modelStr
+            rawModelDisplayName = modelStr
         }
 
         let agentState = (root["agent_state"] as? String)
             ?? (root["state"] as? String)
             ?? (root["status"] as? String)
 
-        var contextUsedPercentage: Double?
+        let rawPlanTier = ((root["plan_tier"] as? String) ?? (root["planTier"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let planTier: String? = (rawPlanTier?.isEmpty == false) ? rawPlanTier : nil
+
+        var rawContextUsedPercentage: Double?
         if let ctxDict = root["context_window"] as? [String: Any] {
-            contextUsedPercentage = doubleValue(ctxDict["used_percentage"])
+            rawContextUsedPercentage = doubleValue(ctxDict["used_percentage"])
                 ?? doubleValue(ctxDict["used_percent"])
         }
+
+        let isInitializing = agentState?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "initializing"
+        let modelDisplayName: String? = isInitializing ? nil : rawModelDisplayName
+        let contextUsedPercentage: Double? = isInitializing ? nil : rawContextUsedPercentage
 
         var quotas: [QuotaBucketSnapshot] = []
         if let quotaDict = root["quota"] as? [String: Any] {
             if quotaDict["remaining_fraction"] != nil || quotaDict["remainingFraction"] != nil {
+                let id = (quotaDict["id"] as? String) ?? "cli-quota"
                 if let snap = parseSingleQuotaBucket(
-                    id: (quotaDict["id"] as? String) ?? "cli-quota",
-                    defaultLabel: (quotaDict["label"] as? String) ?? modelDisplayName ?? "CLI Quota",
+                    id: id,
+                    defaultLabel: (quotaDict["label"] as? String) ?? rawModelDisplayName ?? displayLabel(forBucketId: id),
                     dict: quotaDict,
                     fileModifiedAt: fileModifiedAt,
                     now: now
@@ -109,7 +124,7 @@ public final class StatusLineBridge: @unchecked Sendable {
             } else if let bucketsArray = quotaDict["buckets"] as? [[String: Any]] {
                 for (index, item) in bucketsArray.enumerated() {
                     let id = (item["id"] as? String) ?? "cli-quota-\(index)"
-                    let label = (item["label"] as? String) ?? (item["name"] as? String) ?? id
+                    let label = (item["label"] as? String) ?? (item["name"] as? String) ?? displayLabel(forBucketId: id)
                     if let snap = parseSingleQuotaBucket(
                         id: id,
                         defaultLabel: label,
@@ -121,11 +136,17 @@ public final class StatusLineBridge: @unchecked Sendable {
                     }
                 }
             } else {
-                for key in quotaDict.keys.sorted() {
+                let sortedKeys = quotaDict.keys.sorted { lhs, rhs in
+                    let pL = priorityRank(forBucketId: lhs)
+                    let pR = priorityRank(forBucketId: rhs)
+                    if pL != pR { return pL < pR }
+                    return lhs < rhs
+                }
+                for key in sortedKeys {
                     if let subDict = quotaDict[key] as? [String: Any],
                        let snap = parseSingleQuotaBucket(
                            id: key,
-                           defaultLabel: (subDict["label"] as? String) ?? key,
+                           defaultLabel: (subDict["label"] as? String) ?? displayLabel(forBucketId: key),
                            dict: subDict,
                            fileModifiedAt: fileModifiedAt,
                            now: now
@@ -137,7 +158,7 @@ public final class StatusLineBridge: @unchecked Sendable {
         } else if let quotaArray = root["quota"] as? [[String: Any]] {
             for (index, item) in quotaArray.enumerated() {
                 let id = (item["id"] as? String) ?? "cli-quota-\(index)"
-                let label = (item["label"] as? String) ?? id
+                let label = (item["label"] as? String) ?? displayLabel(forBucketId: id)
                 if let snap = parseSingleQuotaBucket(
                     id: id,
                     defaultLabel: label,
@@ -150,13 +171,48 @@ public final class StatusLineBridge: @unchecked Sendable {
             }
         }
 
+        let explicitFreshFlag = root["_has_live_quota"] as? Bool
+        let hasFreshQuota = !quotas.isEmpty && (explicitFreshFlag ?? true)
+
         return StatusLinePayload(
             modelDisplayName: modelDisplayName,
             agentState: agentState,
             contextUsedPercentage: contextUsedPercentage,
+            planTier: planTier,
             quotas: quotas,
+            hasFreshQuotaPayload: hasFreshQuota,
             lastUpdated: fileModifiedAt
         )
+    }
+
+    public static func displayLabel(forBucketId id: String) -> String {
+        switch id.lowercased() {
+        case "gemini-5h":
+            return "Gemini 5h"
+        case "gemini-weekly":
+            return "Gemini Wk"
+        case "3p-5h":
+            return "Claude/3P 5h"
+        case "3p-weekly":
+            return "Claude/3P Wk"
+        default:
+            return id
+        }
+    }
+
+    public static func priorityRank(forBucketId id: String) -> Int {
+        switch id.lowercased() {
+        case "gemini-5h":
+            return 0
+        case "gemini-weekly":
+            return 1
+        case "3p-5h":
+            return 2
+        case "3p-weekly":
+            return 3
+        default:
+            return 100
+        }
     }
 
     private static func parseSingleQuotaBucket(
@@ -186,7 +242,7 @@ public final class StatusLineBridge: @unchecked Sendable {
         }
         if let resetTime {
             let liveRemaining = resetTime.timeIntervalSince(now)
-            if resetInSeconds == nil {
+            if resetInSeconds == nil || abs(now.timeIntervalSince(fileModifiedAt)) > 1.0 {
                 resetInSeconds = max(0.0, liveRemaining)
             }
         }
@@ -339,7 +395,6 @@ public final class StatusLineBridge: @unchecked Sendable {
 
     private static func ensureHookScriptExistsIfDefault(at hookScriptPath: String) {
         let fm = FileManager.default
-        guard !fm.fileExists(atPath: hookScriptPath) else { return }
         let defaultHomeHook = resolveDefaultHookScriptPath(home: fm.homeDirectoryForCurrentUser.path)
         guard hookScriptPath == defaultHomeHook else { return }
 
@@ -352,7 +407,8 @@ public final class StatusLineBridge: @unchecked Sendable {
         ].compactMap { $0 }
 
         for sourcePath in candidates where fm.fileExists(atPath: sourcePath) {
-            if (try? fm.copyItem(atPath: sourcePath, toPath: hookScriptPath)) != nil {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: sourcePath)) {
+                try? data.write(to: targetURL, options: .atomic)
                 try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hookScriptPath)
                 return
             }

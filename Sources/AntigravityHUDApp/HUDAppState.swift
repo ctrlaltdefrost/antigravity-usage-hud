@@ -55,6 +55,9 @@ final class HUDAppState: ObservableObject {
     let engine: TelemetryEngine
 
     @Published private(set) var snapshot: TelemetrySnapshot
+    @Published private(set) var isAutoSyncing: Bool = false
+    @Published private(set) var autoSyncEnabled: Bool = true
+    @Published private(set) var lastAutoSyncStatus: String?
     @Published var mode: HUDMode
     @Published private(set) var lastVisibleMode: HUDMode
     @Published var theme: HUDTheme
@@ -79,6 +82,9 @@ final class HUDAppState: ObservableObject {
         self.engine = resolvedEngine
         self.userDefaults = userDefaults
         self.snapshot = resolvedEngine.snapshot
+        self.isAutoSyncing = resolvedEngine.isAutoSyncing
+        self.autoSyncEnabled = resolvedEngine.autoSyncEnabled
+        self.lastAutoSyncStatus = resolvedEngine.lastAutoSyncStatus
 
         let savedLastVisible = userDefaults.string(forKey: DefaultsKeys.lastVisibleMode)
             .flatMap(HUDMode.init(rawValue:))
@@ -121,6 +127,36 @@ final class HUDAppState: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] newSnapshot in
                 self?.handleSnapshotUpdate(newSnapshot)
+            }
+            .store(in: &cancellables)
+
+        engine.$isAutoSyncing
+            .receive(on: RunLoop.main)
+            .sink { [weak self] syncing in
+                guard let self else { return }
+                let wasSyncing = self.isAutoSyncing
+                self.isAutoSyncing = syncing
+                if wasSyncing && !syncing, let status = self.engine.lastAutoSyncStatus {
+                    self.lastAutoSyncStatus = status
+                    self.showToast(
+                        icon: "arrow.triangle.2.circlepath.circle.fill",
+                        message: status.uppercased()
+                    )
+                }
+            }
+            .store(in: &cancellables)
+
+        engine.$autoSyncEnabled
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                self?.autoSyncEnabled = enabled
+            }
+            .store(in: &cancellables)
+
+        engine.$lastAutoSyncStatus
+            .receive(on: RunLoop.main)
+            .sink { [weak self] status in
+                self?.lastAutoSyncStatus = status
             }
             .store(in: &cancellables)
     }
@@ -167,6 +203,22 @@ final class HUDAppState: ObservableObject {
         snapshot.quotas.min(by: { $0.remainingFraction < $1.remainingFraction })
     }
 
+    var lowest5hQuota: QuotaBucketSnapshot? {
+        snapshot.quotas
+            .filter { $0.id.localizedCaseInsensitiveContains("5h") || $0.label.localizedCaseInsensitiveContains("5h") }
+            .min(by: { $0.remainingFraction < $1.remainingFraction })
+    }
+
+    var lowestWeeklyQuota: QuotaBucketSnapshot? {
+        snapshot.quotas
+            .filter {
+                $0.id.localizedCaseInsensitiveContains("weekly")
+                    || $0.label.localizedCaseInsensitiveContains("wk")
+                    || $0.label.localizedCaseInsensitiveContains("week")
+            }
+            .min(by: { $0.remainingFraction < $1.remainingFraction })
+    }
+
     var pinnedProject: ProjectSpend? {
         if let pinnedId = snapshot.pinnedProjectId {
             return snapshot.projects.first { $0.isPinned || $0.id == pinnedId || $0.name == pinnedId }
@@ -187,6 +239,14 @@ final class HUDAppState: ObservableObject {
         case .h5: return project.tokens5h
         case .h24: return project.tokens24h
         case .d7: return project.tokens7d
+        }
+    }
+
+    func cost(for project: ProjectSpend, in window: TelemetryTimeWindow) -> Double {
+        switch window {
+        case .h5: return project.cost5h
+        case .h24: return project.cost24h
+        case .d7: return project.cost7d
         }
     }
 
@@ -308,6 +368,23 @@ final class HUDAppState: ObservableObject {
         showToast(icon: "arrow.clockwise", message: "TELEMETRY SYNCED")
     }
 
+    func syncCLIQuotaNow() {
+        guard !engine.isAutoSyncing else { return }
+        ensureHookScriptExistsIfNeeded()
+        TelemetryAudio.shared.playModeSwitch()
+        showToast(icon: "arrow.triangle.2.circlepath", message: "SYNCING LIVE QUOTA...")
+        engine.syncCLIQuotaNow()
+    }
+
+    func toggleAutoSyncEnabled() {
+        engine.autoSyncEnabled.toggle()
+        TelemetryAudio.shared.playModeSwitch()
+        showToast(
+            icon: engine.autoSyncEnabled ? "clock.badge.checkmark" : "pause.circle",
+            message: engine.autoSyncEnabled ? "AUTO-SYNC EVERY 5M ON" : "AUTO-SYNC PAUSED"
+        )
+    }
+
     // MARK: - Launch at Login (SMAppService)
 
     var isRunningFromAppBundle: Bool {
@@ -362,7 +439,9 @@ final class HUDAppState: ObservableObject {
     private func ensureHookScriptExistsIfNeeded() {
         let targetPath = engine.statusLineBridge.hookScriptPath
         let fm = FileManager.default
-        if fm.isExecutableFile(atPath: targetPath) {
+        if fm.isExecutableFile(atPath: targetPath),
+           let existing = try? String(contentsOfFile: targetPath, encoding: .utf8),
+           existing.contains("_has_live_quota") {
             return
         }
 
@@ -373,7 +452,7 @@ final class HUDAppState: ObservableObject {
         if let bundledScript = Bundle.main.url(forResource: "agy-hud-hook", withExtension: "sh"),
            let data = try? Data(contentsOf: bundledScript) {
             try? data.write(to: targetURL, options: .atomic)
-        } else if !fm.fileExists(atPath: targetPath) {
+        } else {
             try? Self.embeddedHookScript.write(to: targetURL, atomically: true, encoding: .utf8)
         }
         try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: targetPath)
@@ -392,21 +471,69 @@ final class HUDAppState: ObservableObject {
 
     if [ -n "$INPUT_JSON" ]; then
         TMP_FILE="$(mktemp "$HUD_DIR/statusline_snapshot.XXXXXX")"
-        printf '%s\\n' "$INPUT_JSON" > "$TMP_FILE"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$INPUT_JSON" "$SNAPSHOT_PATH" "$TMP_FILE" <<'PY' 2>/dev/null || printf '%s\\n' "$INPUT_JSON" > "$TMP_FILE"
+    import json, os, sys
+
+    raw_in, snap_path, tmp_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    try:
+        data = json.loads(raw_in)
+        if not isinstance(data, dict):
+            raise ValueError("not dict")
+    except Exception:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(raw_in + "\\n")
+        sys.exit(0)
+
+    data.pop("email", None)
+
+    q = data.get("quota")
+    has_non_empty_quota = isinstance(q, (dict, list)) and len(q) > 0
+
+    if has_non_empty_quota:
+        data["_has_live_quota"] = True
+    else:
+        data["_has_live_quota"] = False
+        if os.path.exists(snap_path):
+            try:
+                with open(snap_path, "r", encoding="utf-8") as prev_f:
+                    prev = json.load(prev_f)
+                if isinstance(prev, dict):
+                    prev_q = prev.get("quota")
+                    if isinstance(prev_q, (dict, list)) and len(prev_q) > 0:
+                        data["quota"] = prev_q
+                    if not data.get("plan_tier") and prev.get("plan_tier"):
+                        data["plan_tier"] = prev["plan_tier"]
+            except Exception:
+                pass
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.write("\\n")
+    PY
+        else
+            printf '%s\\n' "$INPUT_JSON" > "$TMP_FILE"
+        fi
         mv -f "$TMP_FILE" "$SNAPSHOT_PATH"
     fi
 
     if command -v python3 >/dev/null 2>&1 && [ -n "$INPUT_JSON" ]; then
-        python3 - "$INPUT_JSON" <<'PY' 2>/dev/null || printf "⚡ AGY HUD\\n"
-    import json, sys
+        python3 - "$SNAPSHOT_PATH" "$INPUT_JSON" <<'PY' 2>/dev/null || printf "⚡ AGY HUD\\n"
+    import json, os, sys
 
+    snap_path, raw_in = sys.argv[1], sys.argv[2]
+    data = {}
     try:
-        data = json.loads(sys.argv[1])
+        if os.path.exists(snap_path):
+            with open(snap_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = json.loads(raw_in)
     except Exception:
         print("⚡ AGY HUD")
         sys.exit(0)
 
-    model = "AGY"
+    model = data.get("plan_tier") or "AGY"
     m = data.get("model")
     if isinstance(m, dict):
         model = m.get("display_name") or m.get("name") or model
@@ -417,7 +544,9 @@ final class HUDAppState: ObservableObject {
     ctx = data.get("context_window")
     if isinstance(ctx, dict) and ctx.get("used_percentage") is not None:
         try:
-            ctx_part = f" · Ctx {float(ctx['used_percentage']):.0f}%"
+            pct = float(ctx["used_percentage"])
+            if pct > 0:
+                ctx_part = f" · Ctx {pct:.0f}%"
         except Exception:
             pass
 
@@ -425,6 +554,12 @@ final class HUDAppState: ObservableObject {
     q = data.get("quota")
     if isinstance(q, dict):
         rem = q.get("remaining_fraction")
+        if rem is None:
+            for k in ("gemini-5h", "3p-5h", "gemini-weekly", "3p-weekly"):
+                v = q.get(k)
+                if isinstance(v, dict) and v.get("remaining_fraction") is not None:
+                    rem = v.get("remaining_fraction")
+                    break
         if rem is None:
             for v in q.values():
                 if isinstance(v, dict) and v.get("remaining_fraction") is not None:

@@ -16,7 +16,7 @@ final class HUDWindowController: NSObject, NSWindowDelegate {
     }
 
     static let compactSize = CGSize(width: 396, height: 76)
-    static let expandedSize = CGSize(width: 548, height: 684)
+    static let expandedSize = CGSize(width: 548, height: 724)
 
     private let appState: HUDAppState
     private let userDefaults: UserDefaults

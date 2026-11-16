@@ -94,6 +94,87 @@ final class StatusLineBridgeTests: XCTestCase {
         XCTAssertEqual(payload?.quotas[1].remainingFraction, 0.90)
     }
 
+    func testPrioritySortingFourBuckets() {
+        let json = """
+        {
+            "plan_tier": "Google AI Ultra",
+            "agent_state": "idle",
+            "quota": {
+                "3p-weekly": {
+                    "remaining_fraction": 0.95,
+                    "reset_in_seconds": 259200
+                },
+                "gemini-5h": {
+                    "remaining_fraction": 0.82,
+                    "reset_in_seconds": 7200
+                },
+                "3p-5h": {
+                    "remaining_fraction": 0.74,
+                    "reset_in_seconds": 10800
+                },
+                "gemini-weekly": {
+                    "remaining_fraction": 0.91,
+                    "reset_in_seconds": 360000
+                }
+            }
+        }
+        """
+
+        let payload = StatusLineBridge.parseStatusLineJSON(json)
+        XCTAssertNotNil(payload)
+        XCTAssertEqual(payload?.planTier, "Google AI Ultra")
+        XCTAssertEqual(payload?.quotas.count, 4)
+
+        // Exact Priority Order:
+        // 1. gemini-5h -> Gemini 5h
+        // 2. gemini-weekly -> Gemini Wk
+        // 3. 3p-5h -> Claude/3P 5h
+        // 4. 3p-weekly -> Claude/3P Wk
+        XCTAssertEqual(payload?.quotas[0].id, "gemini-5h")
+        XCTAssertEqual(payload?.quotas[0].label, "Gemini 5h")
+        XCTAssertEqual(payload?.quotas[0].remainingFraction, 0.82)
+
+        XCTAssertEqual(payload?.quotas[1].id, "gemini-weekly")
+        XCTAssertEqual(payload?.quotas[1].label, "Gemini Wk")
+        XCTAssertEqual(payload?.quotas[1].remainingFraction, 0.91)
+
+        XCTAssertEqual(payload?.quotas[2].id, "3p-5h")
+        XCTAssertEqual(payload?.quotas[2].label, "Claude/3P 5h")
+        XCTAssertEqual(payload?.quotas[2].remainingFraction, 0.74)
+
+        XCTAssertEqual(payload?.quotas[3].id, "3p-weekly")
+        XCTAssertEqual(payload?.quotas[3].label, "Claude/3P Wk")
+        XCTAssertEqual(payload?.quotas[3].remainingFraction, 0.95)
+    }
+
+    func testInitializingStateSuppressesModelAndContext() {
+        let json = """
+        {
+            "model": "gemini-2.5-pro",
+            "agent_state": "initializing",
+            "plan_tier": "Standard Pro",
+            "context_window": {
+                "used_percentage": 0.0
+            },
+            "quota": {
+                "gemini-5h": {
+                    "remaining_fraction": 0.99,
+                    "reset_in_seconds": 18000
+                }
+            }
+        }
+        """
+
+        let payload = StatusLineBridge.parseStatusLineJSON(json)
+        XCTAssertNotNil(payload)
+        XCTAssertEqual(payload?.agentState, "initializing")
+        XCTAssertEqual(payload?.planTier, "Standard Pro")
+        // Model and context must be suppressed during initializing state to avoid clutter
+        XCTAssertNil(payload?.modelDisplayName, "modelDisplayName must be nil when initializing")
+        XCTAssertNil(payload?.contextUsedPercentage, "contextUsedPercentage must be nil when initializing")
+        XCTAssertEqual(payload?.quotas.count, 1)
+    }
+
     // MARK: - settings.json Hook Install & Uninstall (Isolated Temp Directory)
 
     func testHookInstallPreservesUnrelatedSettingsKeys() throws {

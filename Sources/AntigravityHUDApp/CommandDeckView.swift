@@ -47,8 +47,20 @@ struct CommandDeckView: View {
                         .foregroundStyle(theme.textPrimary)
                         .lineLimit(1)
 
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         liveAgentBadge(theme: theme)
+
+                        if let planTier = appState.snapshot.planTier, !planTier.isEmpty {
+                            Text(planTier.uppercased())
+                                .font(.system(size: 8, weight: .black, design: .monospaced))
+                                .foregroundStyle(theme.accent)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(theme.accent.opacity(0.14)))
+                                .overlay(Capsule().stroke(theme.accent.opacity(0.45), lineWidth: 0.6))
+                                .lineLimit(1)
+                                .fixedSize()
+                        }
 
                         if let model = appState.snapshot.activeModelName, !model.isEmpty {
                             Text(model.uppercased())
@@ -61,7 +73,7 @@ struct CommandDeckView: View {
                                 .lineLimit(1)
                         }
 
-                        if let ctxPct = appState.snapshot.cliContextUsedPercent {
+                        if let ctxPct = appState.snapshot.cliContextUsedPercent, ctxPct > 0 {
                             Text("CLI CTX \(Int(ctxPct.rounded()))%")
                                 .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                                 .monospacedDigit()
@@ -396,9 +408,10 @@ struct CommandDeckView: View {
                         QuotaCalibrationPopover(appState: appState)
                     }
 
-                    if !appState.snapshot.hookInstalled {
+                    if !appState.snapshot.hookInstalled && !appState.isAutoSyncing {
                         Button {
                             appState.toggleCLIStatusLineHook()
+                            appState.syncCLIQuotaNow()
                         } label: {
                             HStack(spacing: 3) {
                                 Image(systemName: "bolt.fill")
@@ -414,21 +427,15 @@ struct CommandDeckView: View {
                             .fixedSize()
                         }
                         .buttonStyle(.plain)
-                        .help("Enable official agy CLI statusLine hook for live quota sync")
-                    } else if !hasLiveCLI {
-                        HStack(spacing: 2.5) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 8))
-                            Text("CLI SYNCED")
-                                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .help("Enable official agy CLI statusLine hook and sync live server quotas")
+                    } else {
+                        AutoSyncQuotaButton(
+                            theme: theme,
+                            isSyncing: appState.isAutoSyncing,
+                            lastStatus: appState.lastAutoSyncStatus
+                        ) {
+                            appState.syncCLIQuotaNow()
                         }
-                        .foregroundStyle(theme.accent)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(theme.accent.opacity(0.14)))
-                        .overlay(Capsule().stroke(theme.accent.opacity(0.42), lineWidth: 0.7))
-                        .fixedSize()
-                        .help("CLI hook active — run 'agy' in terminal to stream exact backend quota % & reset times, or click Calibrate to sync Desktop Settings.")
                     }
 
                     Spacer(minLength: 2)
@@ -462,42 +469,33 @@ struct CommandDeckView: View {
 
                 // Main Dual-Column Core
                 HStack(alignment: .center, spacing: 12) {
-                    // Left: Orbital Quota Rings with ticking countdown
-                    let quotas = appState.snapshot.quotas
-                    let ringSize: CGFloat = quotas.count == 1 ? 112 : 98
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 10) {
-                            ForEach(quotas.prefix(4)) { quota in
-                                VStack(spacing: 4) {
-                                    TimelineView(.periodic(from: .now, by: 1.0)) { timeline in
-                                        let countdown = HUDFormatters.countdown(
-                                            resetTime: quota.resetTime,
-                                            fallbackSeconds: quota.resetInSeconds,
-                                            now: timeline.date
-                                        )
-                                        OrbitalRingGauge(
-                                            progress: quota.remainingFraction,
-                                            metricText: HUDFormatters.percent(quota.remainingFraction),
-                                            subtitle: compactQuotaLabel(quota.label),
-                                            countdownText: "↻ \(countdown)",
-                                            theme: theme,
-                                            isActive: appState.hasRunningAgents,
-                                            isWarning: (quota.sourceBadge == "LIVE CLI" || quota.sourceBadge == "CALIBRATED") && quota.remainingFraction < 0.25,
-                                            size: ringSize,
-                                            showTicks: true
-                                        )
-                                    }
-                                    .frame(width: ringSize, height: ringSize)
+                    // Left: 2x2 Orbital Quota Ring Grid (3-4 quotas) or side-by-side (1-2 quotas)
+                    let quotas = Array(appState.snapshot.quotas.prefix(4))
+                    let useGrid = quotas.count >= 3
+                    let ringSize: CGFloat = useGrid ? 86 : (quotas.count == 1 ? 112 : 98)
 
-                                    Text(quota.sourceBadge)
-                                        .font(.system(size: 8, weight: .bold, design: .monospaced))
-                                        .foregroundStyle(quota.sourceBadge == "LIVE CLI" ? theme.accent : theme.textSecondary)
+                    Group {
+                        if useGrid {
+                            let columns = [
+                                GridItem(.fixed(90), spacing: 8),
+                                GridItem(.fixed(90), spacing: 8)
+                            ]
+                            LazyVGrid(columns: columns, spacing: 6) {
+                                ForEach(quotas) { quota in
+                                    quotaRingCell(quota: quota, ringSize: ringSize, theme: theme)
                                 }
                             }
+                            .frame(width: 188)
+                        } else {
+                            HStack(spacing: 10) {
+                                ForEach(quotas) { quota in
+                                    quotaRingCell(quota: quota, ringSize: ringSize, theme: theme)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                            .frame(width: quotas.count == 1 ? 122 : 212)
                         }
-                        .padding(.vertical, 2)
                     }
-                    .frame(width: quotas.count == 1 ? 122 : 212)
 
                     // Right: Sparkline + Burn Velocity Stats
                     VStack(alignment: .leading, spacing: 7) {
@@ -505,7 +503,7 @@ struct CommandDeckView: View {
                             data: metrics.sparklineBuckets,
                             theme: theme,
                             isActive: appState.hasRunningAgents,
-                            height: 76,
+                            height: useGrid ? 114 : 76,
                             unitSuffix: "/m"
                         )
 
@@ -578,9 +576,47 @@ struct CommandDeckView: View {
         .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.09), lineWidth: 0.7))
     }
 
+    @ViewBuilder
+    private func quotaRingCell(quota: QuotaBucketSnapshot, ringSize: CGFloat, theme: HUDTheme) -> some View {
+        VStack(spacing: 2) {
+            TimelineView(.periodic(from: .now, by: 1.0)) { timeline in
+                let countdown = HUDFormatters.countdown(
+                    resetTime: quota.resetTime,
+                    fallbackSeconds: quota.resetInSeconds,
+                    now: timeline.date
+                )
+                OrbitalRingGauge(
+                    progress: quota.remainingFraction,
+                    metricText: HUDFormatters.percent(quota.remainingFraction),
+                    subtitle: compactQuotaLabel(quota.label),
+                    countdownText: "↻ \(countdown)",
+                    theme: theme,
+                    isActive: appState.hasRunningAgents,
+                    isWarning: (quota.sourceBadge == "LIVE CLI" || quota.sourceBadge == "CALIBRATED") && quota.remainingFraction < 0.25,
+                    size: ringSize,
+                    showTicks: true
+                )
+            }
+            .frame(width: ringSize, height: ringSize)
+
+            Text(quota.sourceBadge)
+                .font(.system(size: 7.5, weight: .bold, design: .monospaced))
+                .foregroundStyle(quota.sourceBadge == "LIVE CLI" ? theme.accent : theme.textSecondary)
+                .lineLimit(1)
+        }
+    }
+
     private func compactQuotaLabel(_ raw: String) -> String {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch normalized.lowercased() {
+        case "gemini-5h", "gemini 5h":
+            return "GEMINI 5H"
+        case "gemini-weekly", "gemini wk", "gemini weekly":
+            return "GEMINI WK"
+        case "3p-5h", "claude/3p 5h", "claude 5h":
+            return "CLAUDE 5H"
+        case "3p-weekly", "claude/3p wk", "claude wk", "claude/3p weekly":
+            return "CLAUDE WK"
         case "frontier 5h pool", "frontier 5h":
             return "FRONTIER 5H"
         case "flash / fast pool", "flash 5h", "flash / fast":
@@ -623,6 +659,7 @@ struct CommandDeckView: View {
                     VStack(spacing: 8) {
                         ForEach(projects.prefix(10)) { project in
                             let tokens = appState.tokens(for: project, in: appState.selectedWindow)
+                            let projectCost = appState.cost(for: project, in: appState.selectedWindow)
                             let barProgress = Double(tokens) / Double(maxWindowTokens)
                             let share = Double(tokens) / Double(totalWindowTokens)
                             let isDrifting = appState.isOutburningPinned(project)
@@ -680,10 +717,15 @@ struct CommandDeckView: View {
 
                                         Spacer(minLength: 4)
 
-                                        Text("\(HUDFormatters.tokens(tokens)) · \(HUDFormatters.percent(share))")
-                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                            .monospacedDigit()
-                                            .foregroundStyle(isDrifting ? theme.warning : theme.textSecondary)
+                                        HStack(spacing: 3) {
+                                            Text(HUDFormatters.currency(projectCost))
+                                                .foregroundStyle(isDrifting ? theme.warning : theme.secondary)
+                                            Text("· \(HUDFormatters.tokens(tokens)) · \(HUDFormatters.percent(share))")
+                                                .foregroundStyle(isDrifting ? theme.warning : theme.textSecondary)
+                                        }
+                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        .monospacedDigit()
+                                        .lineLimit(1)
                                     }
 
                                     HorizontalEnergyBar(
@@ -703,7 +745,7 @@ struct CommandDeckView: View {
                     }
                     .padding(.trailing, 4)
                 }
-                .frame(height: 118)
+                .frame(height: 124)
             }
         }
     }
@@ -886,5 +928,43 @@ private struct DriftAlertFlashBadge: View {
             .fixedSize()
             .opacity(pulse)
         }
+    }
+}
+
+private struct AutoSyncQuotaButton: View {
+    let theme: HUDTheme
+    let isSyncing: Bool
+    let lastStatus: String?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                if isSyncing {
+                    TimelineView(.animation(minimumInterval: 1.0 / 12.0)) { timeline in
+                        let degrees = (timeline.date.timeIntervalSinceReferenceDate * 320.0)
+                            .truncatingRemainder(dividingBy: 360.0)
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .rotationEffect(.degrees(degrees))
+                    }
+                } else {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 8.5, weight: .bold))
+                }
+
+                Text(isSyncing ? "Syncing" : "Auto-Sync")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            }
+            .foregroundStyle(isSyncing ? theme.accent : theme.primary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill((isSyncing ? theme.accent : theme.primary).opacity(0.14)))
+            .overlay(Capsule().stroke((isSyncing ? theme.accent : theme.primary).opacity(0.45), lineWidth: 0.75))
+            .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .disabled(isSyncing)
+        .help(lastStatus.map { "Sync live server quotas now (0 tokens) · Last: \($0)" } ?? "Sync live server quotas now (0 tokens)")
     }
 }

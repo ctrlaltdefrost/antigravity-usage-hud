@@ -5,16 +5,27 @@ import Foundation
 public final class TelemetryEngine: ObservableObject {
     private static let pinnedProjectDefaultsKey = "com.antigravity.hud.pinnedProjectId"
     private static let calibratedQuotasDefaultsKey = "com.antigravity.hud.calibratedQuotas"
+    private static let autoSyncEnabledDefaultsKey = "com.antigravity.hud.autoSyncEnabled"
+    private static let autoSyncIntervalSeconds: TimeInterval = 300.0
 
     @Published public private(set) var snapshot: TelemetrySnapshot
     @Published public private(set) var pinnedProjectId: String?
     @Published public private(set) var calibratedQuotas: [QuotaBucketSnapshot]
+    @Published public private(set) var isAutoSyncing: Bool = false
+    @Published public var autoSyncEnabled: Bool {
+        didSet {
+            userDefaults.set(autoSyncEnabled, forKey: Self.autoSyncEnabledDefaultsKey)
+        }
+    }
+    @Published public private(set) var lastAutoSyncStatus: String?
 
     public let summaryReader: SQLiteSummaryReader
     public let transcriptReader: TranscriptReader
     public let statusLineBridge: StatusLineBridge
     private let userDefaults: UserDefaults
     private var pollTimer: Timer?
+    private var lastAutoSyncAttemptDate: Date = .distantPast
+    private let allowAutoSyncProcessSpawn: Bool
 
     public init(
         summaryReader: SQLiteSummaryReader = SQLiteSummaryReader(),
@@ -27,6 +38,13 @@ public final class TelemetryEngine: ObservableObject {
         self.transcriptReader = transcriptReader
         self.statusLineBridge = statusLineBridge
         self.userDefaults = userDefaults
+        self.allowAutoSyncProcessSpawn = autoRefreshOnInit
+
+        if userDefaults.object(forKey: Self.autoSyncEnabledDefaultsKey) != nil {
+            self.autoSyncEnabled = userDefaults.bool(forKey: Self.autoSyncEnabledDefaultsKey)
+        } else {
+            self.autoSyncEnabled = true
+        }
 
         self.pinnedProjectId = userDefaults.string(forKey: Self.pinnedProjectDefaultsKey)
         if let data = userDefaults.data(forKey: Self.calibratedQuotasDefaultsKey),
@@ -46,10 +64,14 @@ public final class TelemetryEngine: ObservableObject {
     public func startPolling(interval: TimeInterval = 2.5) {
         stopPolling()
         refreshNow()
+        maybeTriggerPeriodicAutoSync(now: Date())
         let safeInterval = max(0.5, interval)
         pollTimer = Timer.scheduledTimer(withTimeInterval: safeInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshNow()
+                guard let self else { return }
+                let now = Date()
+                self.refreshNow(now: now)
+                self.maybeTriggerPeriodicAutoSync(now: now)
             }
         }
     }
@@ -57,6 +79,36 @@ public final class TelemetryEngine: ObservableObject {
     public func stopPolling() {
         pollTimer?.invalidate()
         pollTimer = nil
+    }
+
+    public func syncCLIQuotaNow() {
+        guard !isAutoSyncing else { return }
+        isAutoSyncing = true
+        lastAutoSyncStatus = "Syncing CLI..."
+        lastAutoSyncAttemptDate = Date()
+
+        let bridge = statusLineBridge
+        Task { @MainActor [weak self] in
+            let result = await QuotaAutoSync.sync(statusLineBridge: bridge)
+            guard let self else { return }
+            self.isAutoSyncing = false
+            self.lastAutoSyncStatus = result.statusDescription
+            self.refreshNow()
+        }
+    }
+
+    private func maybeTriggerPeriodicAutoSync(now: Date) {
+        guard allowAutoSyncProcessSpawn, autoSyncEnabled, !isAutoSyncing else { return }
+        guard now.timeIntervalSince(lastAutoSyncAttemptDate) >= Self.autoSyncIntervalSeconds else { return }
+
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: statusLineBridge.snapshotPath),
+           let mtime = attrs[.modificationDate] as? Date,
+           now.timeIntervalSince(mtime) < Self.autoSyncIntervalSeconds {
+            return
+        }
+
+        guard QuotaAutoSync.resolveAgyExecutablePath() != nil else { return }
+        syncCLIQuotaNow()
     }
 
     public func pinProject(_ id: String?) {
@@ -188,6 +240,7 @@ public final class TelemetryEngine: ObservableObject {
             activeModelName: cliPayload?.modelDisplayName,
             cliAgentState: cliPayload?.agentState,
             cliContextUsedPercent: cliPayload?.contextUsedPercentage,
+            planTier: cliPayload?.planTier,
             alerts: alerts,
             pinnedProjectId: pinnedProjectId,
             hookInstalled: hookInstalled

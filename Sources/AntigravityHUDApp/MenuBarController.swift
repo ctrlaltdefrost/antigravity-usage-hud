@@ -52,6 +52,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 self?.updateStatusButton()
             }
             .store(in: &cancellables)
+
+        appState.$isAutoSyncing
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.updateStatusButton()
+            }
+            .store(in: &cancellables)
     }
 
     private func updateStatusButton() {
@@ -83,12 +90,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         } else if runningCount > 0 {
             parts.append("\(runningCount) RUN")
         }
-        parts.append(burnText)
-        parts.append(quotaText)
+
+        if let q5h = appState.lowest5hQuota, let qWk = appState.lowestWeeklyQuota {
+            parts.append("\(HUDFormatters.percent(q5h.remainingFraction)) 5H")
+            parts.append("\(HUDFormatters.percent(qWk.remainingFraction)) WK")
+        } else {
+            parts.append(quotaText)
+            parts.append(burnText)
+        }
         button.title = " " + parts.joined(separator: " · ")
 
         let tooltipRate = HUDFormatters.rate(snap.window5h.tokensPerMinute)
-        button.toolTip = "Antigravity HUD · \(burnText) (\(tooltipRate)) · Lowest Quota \(quotaText)"
+        let tierPart = snap.planTier.map { " · \($0)" } ?? ""
+        button.toolTip = "Antigravity HUD\(tierPart) · \(burnText) (\(tooltipRate)) · Lowest Quota \(quotaText)"
     }
 
     // MARK: - NSMenuDelegate
@@ -105,10 +119,22 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         headerItem.isEnabled = false
         menu.addItem(headerItem)
 
+        if let planTier = snap.planTier, !planTier.isEmpty {
+            let tierItem = NSMenuItem(title: "Plan: \(planTier)", action: nil, keyEquivalent: "")
+            tierItem.isEnabled = false
+            menu.addItem(tierItem)
+        }
+
         if let model = snap.activeModelName, !model.isEmpty {
             let modelItem = NSMenuItem(title: "CLI Model: \(model)", action: nil, keyEquivalent: "")
             modelItem.isEnabled = false
             menu.addItem(modelItem)
+        }
+
+        if let syncStatus = appState.lastAutoSyncStatus, !syncStatus.isEmpty {
+            let syncInfoItem = NSMenuItem(title: "Quota Sync: \(syncStatus)", action: nil, keyEquivalent: "")
+            syncInfoItem.isEnabled = false
+            menu.addItem(syncInfoItem)
         }
 
         menu.addItem(.separator())
@@ -181,7 +207,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         loginItem.isEnabled = appState.isRunningFromAppBundle
         menu.addItem(loginItem)
 
-        // Official agy CLI statusLine Hook Toggle
+        // Official agy CLI statusLine Hook & Auto-Sync
+        let syncNowItem = makeActionItem(
+            title: appState.isAutoSyncing ? "Syncing Live Quota…" : "Sync Live Quota Now",
+            action: #selector(syncLiveQuotaNow)
+        )
+        syncNowItem.isEnabled = !appState.isAutoSyncing
+        menu.addItem(syncNowItem)
+
+        let autoSyncItem = makeActionItem(
+            title: "Auto-Sync Quota Every 5m",
+            action: #selector(toggleAutoSync),
+            checked: appState.autoSyncEnabled
+        )
+        menu.addItem(autoSyncItem)
+
         let hookTitle = snap.hookInstalled
             ? "CLI Hook Active ✓ (Disable)"
             : "Enable Live CLI Quota Hook"
@@ -262,6 +302,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleCLIStatusLineHook() {
         appState.toggleCLIStatusLineHook()
+    }
+
+    @objc private func syncLiveQuotaNow() {
+        appState.syncCLIQuotaNow()
+    }
+
+    @objc private func toggleAutoSync() {
+        appState.toggleAutoSyncEnabled()
     }
 
     @objc private func refreshNow() {

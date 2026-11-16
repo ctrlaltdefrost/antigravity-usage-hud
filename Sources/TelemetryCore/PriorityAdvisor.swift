@@ -44,6 +44,9 @@ public enum PriorityAdvisor {
             var tokens5h: Int = 0
             var tokens24h: Int = 0
             var tokens7d: Int = 0
+            var cost5h: Double = 0.0
+            var cost24h: Double = 0.0
+            var cost7d: Double = 0.0
             var activeAgents: Int = 0
             var lastActive: Date = .distantPast
         }
@@ -67,14 +70,22 @@ public enum PriorityAdvisor {
             let ws = resolveWorkspace(for: turn.conversationId)
             var acc = accumulators[ws.id] ?? Accumulator(info: ws)
             let tokens = turn.directTokens
+            let turnCost = (
+                Double(turn.inputTokens) * 3.0 +
+                Double(turn.cacheReadTokens) * 0.30 +
+                Double(turn.outputTokens) * 15.0
+            ) / 1_000_000.0
             if turn.createdAt >= cutoff7d {
                 acc.tokens7d += tokens
+                acc.cost7d += turnCost
             }
             if turn.createdAt >= cutoff24h {
                 acc.tokens24h += tokens
+                acc.cost24h += turnCost
             }
             if turn.createdAt >= cutoff5h {
                 acc.tokens5h += tokens
+                acc.cost5h += turnCost
             }
             if turn.createdAt > acc.lastActive {
                 acc.lastActive = turn.createdAt
@@ -94,6 +105,9 @@ public enum PriorityAdvisor {
                 tokens5h: acc.tokens5h,
                 tokens24h: acc.tokens24h,
                 tokens7d: acc.tokens7d,
+                cost5h: acc.cost5h,
+                cost24h: acc.cost24h,
+                cost7d: acc.cost7d,
                 share5h: share,
                 activeAgents: acc.activeAgents,
                 lastActive: acc.lastActive,
